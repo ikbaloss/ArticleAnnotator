@@ -20,6 +20,10 @@
         .highlight-argument { background-color: rgba(245, 158, 11, 0.3); border-bottom: 2px solid #f59e0b; }
         .highlight-method { background-color: rgba(16, 185, 129, 0.3); border-bottom: 2px solid #10b981; }
         .highlight-evidence { background-color: rgba(6, 182, 212, 0.3); border-bottom: 2px solid #06b6d4; }
+        .ann-hl { border-radius: 3px; padding: 0 1px; cursor: pointer; font-weight: 500; transition: box-shadow .25s; -webkit-box-decoration-break: clone; box-decoration-break: clone; }
+        .ann-hl:hover { filter: brightness(0.92); }
+        .ann-hl.ann-flash { box-shadow: 0 0 0 3px rgba(15, 23, 42, 0.55); }
+        #nodes-list [data-card] { cursor: pointer; }
         .highlight-intro { background-color: rgba(99, 102, 241, 0.3); border-bottom: 2px solid #6366f1; }
         .highlight-impact { background-color: rgba(236, 72, 153, 0.3); border-bottom: 2px solid #ec4899; }
         
@@ -113,6 +117,7 @@
                     </select>
                     <input type="text" id="search-annotations" placeholder="Search annotations..." class="text-xs border border-gray-300 rounded px-2 py-1.5 flex-1 focus:outline-none focus:ring-1 focus:ring-blue-500">
                 </div>
+                <div id="category-legend" class="px-3 py-2 bg-white border-b border-gray-200 flex flex-wrap gap-1.5"></div>
                 <div id="nodes-list" class="flex-1 p-4 overflow-y-auto space-y-3">
                     <div class="text-center py-12 text-gray-400 text-sm">
                         <i class="fa-solid fa-feather text-3xl mb-2 block text-gray-300"></i>
@@ -632,6 +637,7 @@
             const endIndex = startIndex + selectedStr.length;
 
             pendingSelection = { startIndex, endIndex, text: selectedStr };
+            lastSelectionTime = Date.now();
 
             modalSelectedText.textContent = selectedStr;
             modalCategory.value = "Introduction";
@@ -687,29 +693,136 @@
 
             textStats.textContent = `${appState.rawText.length} characters | ${appState.annotations.length} annotations`;
 
-            let htmlOutput = marked.parse(appState.rawText);
-
-            const sortedAnns = [...appState.annotations].sort((a, b) => b.startIndex - a.startIndex);
-            sortedAnns.forEach(ann => {
-                const snippet = appState.rawText.substring(ann.startIndex, ann.endIndex);
-                const hlClass = getHighlightClass(ann.category);
-                const replacement = `<span class="${hlClass} rounded px-0.5 cursor-pointer font-medium" title="${ann.category}: ${ann.subcategory}" onclick="scrollToNode('${ann.id}')">${snippet}</span>`;
-                htmlOutput = htmlOutput.replace(snippet, replacement);
-            });
-
-            textContainer.innerHTML = htmlOutput;
+            textContainer.innerHTML = marked.parse(appState.rawText);
+            applyHighlights();
         }
 
-        function getHighlightClass(category) {
-            switch(category) {
-                case 'Introduction': return 'highlight-intro';
-                case 'Theory Dynamics': return 'highlight-theory-main';
-                case 'Argument & Framing': return 'highlight-argument';
-                case 'Methodology': return 'highlight-method';
-                case 'Evidence & Findings': return 'highlight-evidence';
-                case 'Impact & Dialogue': return 'highlight-impact';
-                default: return 'highlight-theory-main';
+        // One unique colour per category (single source of truth for highlights, badges, legend)
+        const categoryColors = {
+            "Introduction":        "#8b5cf6", // purple
+            "Theory Dynamics":     "#3b82f6", // blue
+            "Argument & Framing":  "#eab308", // yellow
+            "Methodology":         "#22c55e", // green
+            "Evidence & Findings": "#ef4444", // red
+            "Impact & Dialogue":   "#ec4899"  // pink
+        };
+        const getCategoryColor = cat => categoryColors[cat] || "#64748b";
+
+        let unlocatedIds = new Set();
+        let lastSelectionTime = 0;
+
+        const _escRe = str => str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+        function collectTextNodes(root) {
+            const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+            const nodes = [];
+            let full = '';
+            let n;
+            while ((n = walker.nextNode())) {
+                nodes.push({ node: n, start: full.length });
+                full += n.nodeValue;
             }
+            return { nodes, full };
+        }
+
+        // Wrap [start,end) of the rendered text in coloured <span>s (one per text node touched)
+        function wrapRange(root, start, end, ann) {
+            const { nodes } = collectTextNodes(root);
+            const color = getCategoryColor(ann.category);
+            const targets = [];
+            for (const { node, start: ns } of nodes) {
+                const ne = ns + node.nodeValue.length;
+                if (ne <= start || ns >= end) continue;
+                targets.push({ node, from: Math.max(start, ns) - ns, to: Math.min(end, ne) - ns });
+            }
+            let wrapped = 0;
+            for (const t of targets) {
+                const piece = t.node.nodeValue.slice(t.from, t.to);
+                if (!piece.trim() && piece.includes('\n')) continue; // whitespace between blocks
+                let target = t.node;
+                if (t.to < target.nodeValue.length) target.splitText(t.to);
+                if (t.from > 0) target = target.splitText(t.from);
+                const span = document.createElement('span');
+                span.className = 'ann-hl';
+                span.dataset.annId = ann.id;
+                span.title = `${ann.category}: ${ann.subcategory}`;
+                span.style.backgroundColor = color + '4d';
+                span.style.borderBottom = `2px solid ${color}`;
+                target.parentNode.insertBefore(span, target);
+                span.appendChild(target);
+                wrapped++;
+            }
+            return wrapped > 0;
+        }
+
+        // Locate every annotation in the rendered document and keep it highlighted.
+        // Uses the k-th occurrence (same as in rawText) so repeated phrases hit the right place.
+        function applyHighlights() {
+            unlocatedIds = new Set();
+            const root = textContainer;
+            const { full } = collectTextNodes(root); // wrapping never changes this string
+
+            for (const ann of appState.annotations) {
+                const words = (ann.text || '').trim().split(/\s+/).filter(Boolean);
+                if (!words.length) { unlocatedIds.add(ann.id); continue; }
+
+                // which occurrence in rawText was this?
+                let k = 0, pos = -1;
+                const needle = appState.rawText.substring(ann.startIndex, ann.endIndex);
+                if (needle) {
+                    while ((pos = appState.rawText.indexOf(needle, pos + 1)) !== -1 && pos < ann.startIndex) k++;
+                }
+
+                let found = null;
+                for (const sep of ['\\s+', '\\s*']) {
+                    const re = new RegExp(words.map(_escRe).join(sep), 'g');
+                    const matches = [];
+                    let m;
+                    while ((m = re.exec(full)) !== null) {
+                        matches.push({ start: m.index, end: m.index + m[0].length });
+                        if (m[0].length === 0) re.lastIndex++;
+                    }
+                    if (matches.length) { found = matches[k] || matches[0]; break; }
+                }
+
+                if (!found || !wrapRange(root, found.start, found.end, ann)) unlocatedIds.add(ann.id);
+            }
+        }
+
+        // Click a highlight in the text -> jump to its annotation card (delegated)
+        textContainer.addEventListener('click', (e) => {
+            if (Date.now() - lastSelectionTime < 400) return; // this click ended a text selection
+            const hl = e.target.closest('.ann-hl');
+            if (hl) scrollToNode(hl.dataset.annId);
+        });
+
+        // Click an annotation card -> scroll the document to its highlighted text
+        window.revealInText = function(id) {
+            const spans = textContainer.querySelectorAll(`.ann-hl[data-ann-id="${CSS.escape(id)}"]`);
+            if (!spans.length) return;
+            spans[0].scrollIntoView({ behavior: 'smooth', block: 'center' });
+            spans.forEach(sp => sp.classList.add('ann-flash'));
+            setTimeout(() => spans.forEach(sp => sp.classList.remove('ann-flash')), 1800);
+            const card = document.getElementById(`node_card_${id}`);
+            if (card) {
+                card.classList.add('ring-2');
+                card.style.setProperty('--tw-ring-color', getCategoryColor((appState.annotations.find(a => a.id === id) || {}).category));
+                setTimeout(() => card.classList.remove('ring-2'), 1800);
+            }
+        };
+
+        // Colour legend (click a chip to filter by that category; click again to clear)
+        function renderLegend() {
+            const legend = document.getElementById('category-legend');
+            legend.innerHTML = Object.entries(categoryColors).map(([cat, c]) => `
+                <button data-cat="${cat}" class="flex items-center space-x-1 text-[10px] px-1.5 py-0.5 rounded border border-gray-200 hover:bg-gray-50 transition">
+                    <span class="inline-block w-2.5 h-2.5 rounded-sm" style="background:${c}"></span>
+                    <span class="text-gray-600">${cat}</span>
+                </button>`).join('');
+            legend.querySelectorAll('button').forEach(btn => btn.addEventListener('click', () => {
+                filterCategory.value = (filterCategory.value === btn.dataset.cat) ? 'all' : btn.dataset.cat;
+                renderNodesList();
+            }));
         }
 
         function renderNodesList() {
@@ -733,15 +846,16 @@
             }
 
             nodesList.innerHTML = filtered.map(ann => `
-                <div id="node_card_${ann.id}" class="bg-white border border-gray-200 rounded-lg p-3.5 shadow-sm hover:shadow transition space-y-2">
+                <div id="node_card_${ann.id}" data-card onclick="revealInText('${ann.id}')" title="Click to show this passage in the document" class="bg-white border border-gray-200 rounded-lg p-3.5 shadow-sm hover:shadow transition space-y-2" style="border-left: 4px solid ${getCategoryColor(ann.category)}">
                     <div class="flex justify-between items-start">
-                        <span class="text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded bg-slate-100 text-slate-700 border border-slate-200">${ann.category} / ${ann.subcategory}</span>
+                        <span class="text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded text-slate-700 border" style="background:${getCategoryColor(ann.category)}22;border-color:${getCategoryColor(ann.category)}">${ann.category} / ${ann.subcategory}</span>
                         <div class="flex space-x-2 text-gray-400">
-                            <button onclick="editAnnotation('${ann.id}')" class="hover:text-blue-600 transition" title="Edit"><i class="fa-solid fa-pen-to-square text-xs"></i></button>
-                            <button onclick="deleteAnnotation('${ann.id}')" class="hover:text-red-600 transition" title="Delete"><i class="fa-solid fa-trash text-xs"></i></button>
+                            <button onclick="event.stopPropagation(); editAnnotation('${ann.id}')" class="hover:text-blue-600 transition" title="Edit"><i class="fa-solid fa-pen-to-square text-xs"></i></button>
+                            <button onclick="event.stopPropagation(); deleteAnnotation('${ann.id}')" class="hover:text-red-600 transition" title="Delete"><i class="fa-solid fa-trash text-xs"></i></button>
                         </div>
                     </div>
-                    <p class="text-xs text-gray-600 italic bg-gray-50 p-2 rounded border-l-2 border-blue-500">"${escapeHtml(ann.text)}"</p>
+                    <p class="text-xs text-gray-600 italic bg-gray-50 p-2 rounded border-l-2" style="border-left-color:${getCategoryColor(ann.category)}">"${escapeHtml(ann.text)}"</p>
+                    ${unlocatedIds.has(ann.id) ? '<p class="text-[10px] text-amber-600"><i class="fa-solid fa-triangle-exclamation"></i> Passage could not be located in the document view.</p>' : ''}
                     ${ann.commentary ? `<p class="text-xs text-gray-800"><strong class="text-gray-500">Note:</strong> ${escapeHtml(ann.commentary)}</p>` : ''}
                 </div>
             `).join('');
@@ -771,7 +885,12 @@
         };
 
         window.scrollToNode = function(id) {
-            const card = document.getElementById(`node_card_${id}`);
+            let card = document.getElementById(`node_card_${id}`);
+            if (!card && (filterCategory.value !== 'all' || searchAnnotations.value)) {
+                filterCategory.value = 'all'; searchAnnotations.value = '';
+                renderNodesList();
+                card = document.getElementById(`node_card_${id}`);
+            }
             if (card) {
                 tabNodes.click();
                 card.scrollIntoView({ behavior: 'smooth', block: 'center' });
@@ -801,6 +920,8 @@
                 copyJsonBtn.innerHTML = `<i class="fa-regular fa-copy mr-1"></i> Copy JSON`;
             }, 2000);
         });
+    
+        renderLegend();
     </script>
 </body>
 </html>
