@@ -548,11 +548,54 @@
             });
         }
 
-        // Advanced PDF Text Parsing with Coordinate Clustering & Reference Isolation
-        loadPdfInput.addEventListener('change', async (e) => {
-            const file = e.target.files[0];
-            if (!file) return;
+        // =====================================================================
+        //  File access: open files and save the workspace JSON next to the input
+        //  (File System Access API: Chrome / Edge / Opera on desktop.
+        //   Other browsers fall back to a normal download.)
+        // =====================================================================
+        let hasFSA = 'showOpenFilePicker' in window && 'showSaveFilePicker' in window;
+        let sourceHandle = null; // file the user last opened (its folder is where Save starts)
+        let saveHandle = null;   // JSON file that "Save" writes to
 
+        function showToast(msg, isError = false) {
+            let t = document.getElementById('app-toast');
+            if (!t) {
+                t = document.createElement('div');
+                t.id = 'app-toast';
+                t.className = 'fixed bottom-5 right-5 z-[60] px-4 py-2.5 rounded-lg shadow-lg text-sm text-white transition-opacity';
+                document.body.appendChild(t);
+            }
+            t.style.background = isError ? '#b91c1c' : '#047857';
+            t.textContent = msg;
+            t.style.opacity = '1';
+            clearTimeout(t._timer);
+            t._timer = setTimeout(() => { t.style.opacity = '0'; }, 3500);
+        }
+
+        // Use the native file picker when available (gives us a handle to the file's
+        // location); otherwise let the hidden <input type="file"> do its normal job.
+        function wireOpen(inputEl, pickerTypes, processFn) {
+            inputEl.addEventListener('click', async (e) => {
+                if (!hasFSA) return;
+                e.preventDefault();
+                try {
+                    const [handle] = await window.showOpenFilePicker({ types: pickerTypes, multiple: false });
+                    await processFn(await handle.getFile(), handle);
+                } catch (err) {
+                    if (err.name === 'AbortError') return;
+                    if (err.name === 'SecurityError') { hasFSA = false; inputEl.click(); return; } // e.g. sandboxed iframe
+                    showToast('Could not open file: ' + err.message, true);
+                }
+            });
+            inputEl.addEventListener('change', async (e) => {
+                const file = e.target.files[0];
+                if (file) await processFn(file, null);
+                e.target.value = '';
+            });
+        }
+
+        // Advanced PDF Text Parsing with Coordinate Clustering & Reference Isolation
+        async function processPdfFile(file, handle) {
             loadingOverlay.classList.remove('hidden');
             loadingText.textContent = `Formatting "${file.name}"...`;
 
@@ -560,7 +603,7 @@
                 const arrayBuffer = await file.arrayBuffer();
                 const loadingTask = pdfjsLib.getDocument({ data: arrayBuffer });
                 const pdfDoc = await loadingTask.promise;
-                
+
                 const markdownContent = await convertPdfToMarkdown(pdfDoc, (i, n) => {
                     loadingText.textContent = `Processing page ${i} of ${n}...`;
                 });
@@ -568,6 +611,8 @@
                 appState.fileName = file.name;
                 appState.rawText = markdownContent.trim();
                 appState.annotations = [];
+                sourceHandle = handle; // remember the PDF's folder for the first save
+                saveHandle = null;     // new document -> new JSON file
 
                 docTitleDisplay.textContent = file.name;
                 renderTextWithFormatting();
@@ -577,51 +622,83 @@
             } finally {
                 loadingOverlay.classList.add('hidden');
             }
-        });
+        }
 
         // Open Saved Workspace JSON File
-        loadJsonInput.addEventListener('change', (e) => {
-            const file = e.target.files[0];
-            if (!file) return;
-            const reader = new FileReader();
-            reader.onload = (event) => {
-                try {
-                    const data = JSON.parse(event.target.result);
-                    if (data.fileName) {
-                        appState.fileName = data.fileName;
-                        docTitleDisplay.textContent = data.fileName;
-                    }
-                    if (data.rawText) {
-                        appState.rawText = data.rawText;
-                    }
-                    if (Array.isArray(data.annotations)) {
-                        appState.annotations = data.annotations.map(migrateLegacyAnnotation);
-                    }
-                    renderTextWithFormatting();
-                    renderNodesList();
-                    alert("Workspace successfully loaded!");
-                } catch (err) {
-                    alert("Invalid JSON workspace file.");
+        async function processJsonFile(file, handle) {
+            try {
+                const data = JSON.parse(await file.text());
+                if (data.fileName) {
+                    appState.fileName = data.fileName;
+                    docTitleDisplay.textContent = data.fileName;
                 }
-            };
-            reader.readAsText(file);
-        });
+                if (data.rawText) {
+                    appState.rawText = data.rawText;
+                }
+                if (Array.isArray(data.annotations)) {
+                    appState.annotations = data.annotations.map(migrateLegacyAnnotation);
+                }
+                sourceHandle = handle;
+                saveHandle = handle; // Save updates this same file, in the same folder
+                renderTextWithFormatting();
+                renderNodesList();
+                showToast(handle ? `Workspace loaded. Saving will update "${file.name}".` : 'Workspace loaded.');
+            } catch (err) {
+                alert("Invalid JSON workspace file.");
+            }
+        }
 
-        // Save Combined Workspace JSON File
-        exportJsonBtn.addEventListener('click', () => {
-            const workspaceData = {
+        wireOpen(loadPdfInput, [{ description: 'PDF document', accept: { 'application/pdf': ['.pdf'] } }], processPdfFile);
+        wireOpen(loadJsonInput, [{ description: 'Workspace JSON', accept: { 'application/json': ['.json'] } }], processJsonFile);
+
+        // Save Combined Workspace JSON File -> same folder as the input file
+        exportJsonBtn.addEventListener('click', async () => {
+            const json = JSON.stringify({
                 fileName: appState.fileName,
                 rawText: appState.rawText,
                 annotations: appState.annotations,
                 savedAt: new Date().toISOString()
-            };
-            const blob = new Blob([JSON.stringify(workspaceData, null, 2)], { type: 'application/json' });
-            const url = URL.createObjectURL(blob);
+            }, null, 2);
+            const suggestedName = `${(appState.fileName || 'workspace').replace(/\.[^/.]+$/, "")}_workspace.json`;
+
+            if (hasFSA) {
+                try {
+                    if (saveHandle) {
+                        // Reuse the file silently (browser may ask once to allow writing)
+                        let perm = await saveHandle.queryPermission({ mode: 'readwrite' });
+                        if (perm !== 'granted') perm = await saveHandle.requestPermission({ mode: 'readwrite' });
+                        if (perm !== 'granted') { showToast('Permission to write the file was denied.', true); return; }
+                    } else {
+                        const opts = {
+                            suggestedName,
+                            types: [{ description: 'Workspace JSON', accept: { 'application/json': ['.json'] } }]
+                        };
+                        if (sourceHandle) opts.startIn = sourceHandle; // dialog opens in the input file's folder
+                        saveHandle = await window.showSaveFilePicker(opts);
+                    }
+                    const writable = await saveHandle.createWritable();
+                    await writable.write(json);
+                    await writable.close();
+                    showToast(`Saved to "${saveHandle.name}"`);
+                    return;
+                } catch (err) {
+                    if (err.name === 'AbortError') return;
+                    if (err.name !== 'SecurityError') {
+                        saveHandle = null; // file may have been moved/deleted; ask again next time
+                        showToast('Could not save: ' + err.message, true);
+                        return;
+                    }
+                    hasFSA = false; // not allowed here -> fall back to download
+                }
+            }
+
+            const url = URL.createObjectURL(new Blob([json], { type: 'application/json' }));
             const a = document.createElement('a');
             a.href = url;
-            a.download = `${appState.fileName.replace(/\.[^/.]+$/, "")}_workspace.json`;
+            a.download = suggestedName;
             a.click();
             URL.revokeObjectURL(url);
+            showToast('This browser cannot save into the original folder, so the file was downloaded instead.', true);
         });
 
         // Text Selection & Annotation
